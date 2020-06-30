@@ -58,15 +58,15 @@ impl OAuthConfig {
     /// ## main.rs
     /// ```rust,no_run
     /// use rocket::fairing::AdHoc;
-    /// use rocket_oauth2::{HyperSyncRustlsAdapter, OAuth2, OAuthConfig};
+    /// use rocket_oauth2::{HyperRustlsAdapter, OAuth2, OAuthConfig};
     ///
     /// struct GitHub;
     ///
     /// fn main() {
     ///     rocket::ignite()
-    ///         .attach(AdHoc::on_attach("OAuth Config", |rocket| {
-    ///             let config = OAuthConfig::from_config(rocket.config(), "github").unwrap();
-    ///             Ok(rocket.attach(OAuth2::<GitHub>::custom(HyperSyncRustlsAdapter, config)))
+    ///         .attach(AdHoc::on_attach("OAuth Config", |mut rocket| async {
+    ///             let config = OAuthConfig::from_config(rocket.config().await, "github").unwrap();
+    ///             Ok(rocket.attach(OAuth2::<GitHub>::custom(HyperRustlsAdapter, config)))
     ///         }))
     ///         .launch();
     /// }

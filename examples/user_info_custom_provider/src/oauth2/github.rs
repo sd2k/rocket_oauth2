@@ -1,13 +1,9 @@
-use std::io::Read;
-
 use anyhow::{Context, Error};
 use hyper::{
-    header::{qitem, Accept, Authorization, UserAgent},
-    mime::Mime,
-    net::HttpsConnector,
-    Client,
+    header::{ACCEPT, AUTHORIZATION, USER_AGENT},
+    Body, Client,
 };
-use hyper_sync_rustls;
+use hyper_rustls::HttpsConnector;
 use rocket::fairing::{AdHoc, Fairing};
 use rocket::http::{Cookie, Cookies, SameSite};
 use rocket::response::{Debug, Redirect};
@@ -27,7 +23,7 @@ struct GitHubUserInfo {
 /// config_name which must match the key used in Rocket.toml
 /// to specify the custom provider attributes.
 pub fn fairing() -> impl Fairing {
-    AdHoc::on_attach("Github OAuth2", |rocket| {
+    AdHoc::on_attach("Github OAuth2", |rocket| async {
         Ok(rocket
             .mount("/", rocket::routes![github_login, post_install_callback])
             .attach(OAuth2::<GitHubUserInfo>::fairing("github")))
@@ -42,34 +38,40 @@ fn github_login(oauth2: OAuth2<GitHubUserInfo>, mut cookies: Cookies<'_>) -> Red
 /// Callback to handle the authenticated token recieved from GitHub
 /// and store it as a private cookie
 #[rocket::get("/auth/github")]
-fn post_install_callback(
+async fn post_install_callback(
     token: TokenResponse<GitHubUserInfo>,
     mut cookies: Cookies<'_>,
 ) -> Result<Redirect, Debug<Error>> {
-    let https = HttpsConnector::new(hyper_sync_rustls::TlsClient::new());
-    let client = Client::with_connector(https);
+    let https = HttpsConnector::new();
+    let client: Client<_, Body> = Client::builder().build(https);
 
     // Use the token to retrieve the user's GitHub account information.
-    let mime: Mime = "application/vnd.github.v3+json"
-        .parse()
-        .expect("parse GitHub MIME type");
+    let mime = "application/vnd.github.v3+json";
+    let request = hyper::Request::get("https://api.github.com/user")
+        .header(AUTHORIZATION, format!("token {}", token.access_token()))
+        .header(ACCEPT, mime)
+        .header(USER_AGENT, "rocket_oauth2 demo application")
+        .body(Body::empty())
+        .context("failed to build request")?;
+
     let response = client
-        .get("https://api.github.com/user")
-        .header(Authorization(format!("token {}", token.access_token())))
-        .header(Accept(vec![qitem(mime)]))
-        .header(UserAgent("rocket_oauth2 demo application".into()))
-        .send()
+        .request(request)
+        .await
         .context("failed to send request to API")?;
 
-    if !response.status.is_success() {
+    if !response.status().is_success() {
         return Err(anyhow::anyhow!(
             "got non-success status {}",
-            response.status
+            response.status()
         ))?;
     }
 
-    let user_info: GitHubUserInfo = serde_json::from_reader(response.take(2 * 1024 * 1024))
-        .context("failed to deserialize response")?;
+    let body = hyper::body::to_bytes(response)
+        .await
+        .context("failed to read response")?;
+
+    let user_info: GitHubUserInfo =
+        serde_json::from_slice(&body).context("failed to deserialize response")?;
 
     // Set a private cookie with the user's name, and redirect to the home page.
     cookies.add_private(

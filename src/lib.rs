@@ -130,10 +130,10 @@
 mod config;
 mod error;
 
-#[cfg(feature = "hyper_sync_rustls_adapter")]
-mod hyper_sync_rustls_adapter;
-#[cfg(feature = "hyper_sync_rustls_adapter")]
-pub use hyper_sync_rustls_adapter::HyperSyncRustlsAdapter;
+#[cfg(feature = "hyper_rustls_adapter")]
+mod hyper_rustls_adapter;
+#[cfg(feature = "hyper_rustls_adapter")]
+pub use hyper_rustls_adapter::HyperRustlsAdapter;
 
 pub use self::config::*;
 pub use self::error::*;
@@ -148,7 +148,7 @@ use rocket::http::uri::Absolute;
 use rocket::http::{Cookie, Cookies, SameSite, Status};
 use rocket::request::{self, FormItems, FromForm, FromRequest, Request};
 use rocket::response::Redirect;
-use rocket::{Outcome, State};
+use rocket::{async_trait, Outcome, State};
 use serde_json::Value;
 
 const STATE_COOKIE_NAME: &str = "rocket_oauth2_state";
@@ -390,6 +390,7 @@ impl std::convert::TryFrom<Value> for TokenResponse<()> {
     }
 }
 
+#[async_trait]
 impl<'a, 'r, K: 'static> FromRequest<'a, 'r> for TokenResponse<K> {
     type Error = Error;
 
@@ -397,9 +398,10 @@ impl<'a, 'r, K: 'static> FromRequest<'a, 'r> for TokenResponse<K> {
     // TODO: What do providers do if they *reject* the authorization?
     /// Handle the redirect callback, delegating to the Adapter to perform the
     /// token exchange.
-    fn from_request(request: &'a Request<'r>) -> request::Outcome<Self, Self::Error> {
+    async fn from_request(request: &'a Request<'r>) -> request::Outcome<Self, Self::Error> {
         let oauth2 = request
             .guard::<State<Arc<Shared<K>>>>()
+            .await
             .expect("OAuth2 fairing was not attached for this key type!")
             .inner();
 
@@ -432,27 +434,32 @@ impl<'a, 'r, K: 'static> FromRequest<'a, 'r> for TokenResponse<K> {
                 return Outcome::Failure((
                     Status::BadRequest,
                     Error::new_from(ErrorKind::ExchangeFailure, format!("{:?}", e)),
-                ))
+                ));
             }
         };
 
         {
             // Verify that the given state is the same one in the cookie.
             // Begin a new scope so that cookies is not kept around too long.
-            let mut cookies = request.guard::<Cookies<'_>>().expect("request cookies");
+            let mut cookies = request
+                .guard::<Cookies<'_>>()
+                .await
+                .expect("request cookies");
             match cookies.get_private(STATE_COOKIE_NAME) {
                 Some(ref cookie) if cookie.value() == params.state => {
                     cookies.remove(cookie.clone());
                 }
                 _ => {
-                    warn!("The OAuth2 state returned from the server did not match the stored state.");
+                    warn!(
+                        "The OAuth2 state returned from the server did not match the stored state."
+                    );
                     return Outcome::Failure((
                         Status::BadRequest,
                         Error::new_from(
                             ErrorKind::ExchangeFailure,
                             "The OAuth2 state returned from the server did match the stored state.",
                         ),
-                    ))
+                    ));
                 }
             }
         }
@@ -461,6 +468,7 @@ impl<'a, 'r, K: 'static> FromRequest<'a, 'r> for TokenResponse<K> {
         match oauth2
             .adapter
             .exchange_code(&oauth2.config, TokenRequest::AuthorizationCode(params.code))
+            .await
         {
             Ok(mut token) => {
                 // Some providers (at least Strava) provide 'scope' in the callback
@@ -488,6 +496,7 @@ impl<'a, 'r, K: 'static> FromRequest<'a, 'r> for TokenResponse<K> {
 /// Authorization Code Grant as described in RFC 6749 §4.1. The implementing
 /// type must be able to generate an authorization URI and perform the token
 /// exchange.
+#[async_trait]
 pub trait Adapter: Send + Sync + 'static {
     /// Generate an authorization URI as described by RFC 6749 §4.1.1
     /// given configuration, state, and scopes.
@@ -500,7 +509,7 @@ pub trait Adapter: Send + Sync + 'static {
 
     /// Perform the token exchange in accordance with RFC 6749 §4.1.3 given the
     /// authorization code provided by the service.
-    fn exchange_code(
+    async fn exchange_code(
         &self,
         config: &OAuthConfig,
         token: TokenRequest,
@@ -525,7 +534,7 @@ impl<K: 'static> OAuth2<K> {
     ///
     /// ```rust,no_run
     /// use rocket::fairing::AdHoc;
-    /// use rocket_oauth2::{HyperSyncRustlsAdapter, OAuth2, OAuthConfig};
+    /// use rocket_oauth2::{HyperRustlsAdapter, OAuth2, OAuthConfig};
     ///
     /// struct GitHub;
     ///
@@ -534,13 +543,13 @@ impl<K: 'static> OAuth2<K> {
     ///         .attach(OAuth2::<GitHub>::fairing("github"))
     ///         .launch();
     /// }
-    #[cfg(feature = "hyper_sync_rustls_adapter")]
+    #[cfg(feature = "hyper_rustls_adapter")]
     pub fn fairing(config_name: &str) -> impl Fairing {
         // Unfortunate allocations, but necessary because on_attach requires 'static
         let config_name = config_name.to_string();
 
-        AdHoc::on_attach("OAuth Init", move |rocket| {
-            let config = match OAuthConfig::from_config(rocket.config(), &config_name) {
+        AdHoc::on_attach("OAuth Init", move |mut rocket| async move {
+            let config = match OAuthConfig::from_config(rocket.config().await, &config_name) {
                 Ok(c) => c,
                 Err(e) => {
                     log::error!("Invalid configuration: {:?}", e);
@@ -549,7 +558,7 @@ impl<K: 'static> OAuth2<K> {
             };
 
             Ok(rocket.attach(Self::custom(
-                hyper_sync_rustls_adapter::HyperSyncRustlsAdapter,
+                hyper_rustls_adapter::HyperRustlsAdapter,
                 config,
             )))
         })
@@ -561,13 +570,13 @@ impl<K: 'static> OAuth2<K> {
     ///
     /// ```rust,no_run
     /// use rocket::fairing::AdHoc;
-    /// use rocket_oauth2::{HyperSyncRustlsAdapter, OAuth2, OAuthConfig, StaticProvider};
+    /// use rocket_oauth2::{HyperRustlsAdapter, OAuth2, OAuthConfig, StaticProvider};
     ///
     /// struct MyProvider;
     ///
     /// fn main() {
     ///     rocket::ignite()
-    ///         .attach(AdHoc::on_attach("OAuth Config", |rocket| {
+    ///         .attach(AdHoc::on_attach("OAuth Config", |rocket| async {
     ///             let config = OAuthConfig::new(
     ///                 StaticProvider {
     ///                     auth_uri: "auth uri".into(),
@@ -577,7 +586,7 @@ impl<K: 'static> OAuth2<K> {
     ///                 "client secret".to_string(),
     ///                 Some("http://localhost:8000/auth".to_string()),
     ///             );
-    ///             Ok(rocket.attach(OAuth2::<MyProvider>::custom(HyperSyncRustlsAdapter, config)))
+    ///             Ok(rocket.attach(OAuth2::<MyProvider>::custom(HyperRustlsAdapter, config)))
     ///         }))
     ///         .launch();
     /// }
@@ -588,7 +597,9 @@ impl<K: 'static> OAuth2<K> {
             _k: PhantomData,
         };
 
-        AdHoc::on_attach("OAuth Mount", |rocket| Ok(rocket.manage(Arc::new(shared))))
+        AdHoc::on_attach("OAuth Mount", |rocket| async {
+            Ok(rocket.manage(Arc::new(shared)))
+        })
     }
 
     /// Prepare an authentication redirect. This sets a state cookie and returns
@@ -639,30 +650,33 @@ impl<K: 'static> OAuth2<K> {
     /// struct GitHub;
     ///
     /// #[rocket::get("/")]
-    /// fn index(oauth2: OAuth2<GitHub>) {
+    /// async fn index(oauth2: OAuth2<GitHub>) {
     ///     // get previously stored refresh_token
     ///     # let refresh_token = "";
-    ///     oauth2.refresh(refresh_token).unwrap();
+    ///     oauth2.refresh(refresh_token).await.unwrap();
     /// }
     /// ```
-    pub fn refresh(&self, refresh_token: &str) -> Result<TokenResponse<K>, Error> {
+    pub async fn refresh(&self, refresh_token: &str) -> Result<TokenResponse<K>, Error> {
         self.0
             .adapter
             .exchange_code(
                 &self.0.config,
                 TokenRequest::RefreshToken(refresh_token.to_string()),
             )
+            .await
             .map(TokenResponse::cast)
     }
 }
 
+#[async_trait]
 impl<'a, 'r, K: 'static> FromRequest<'a, 'r> for OAuth2<K> {
     type Error = ();
 
-    fn from_request(request: &'a Request<'r>) -> request::Outcome<Self, Self::Error> {
+    async fn from_request(request: &'a Request<'r>) -> request::Outcome<Self, Self::Error> {
         Outcome::Success(OAuth2(
             request
                 .guard::<State<Arc<Shared<K>>>>()
+                .await
                 .expect("OAuth2 fairing was not attached for this key type!")
                 .clone(),
         ))

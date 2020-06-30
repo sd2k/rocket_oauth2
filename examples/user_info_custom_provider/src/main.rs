@@ -3,7 +3,7 @@
 use rocket::http::{Cookie, Cookies};
 use rocket::request::{self, FromRequest, Request};
 use rocket::response::Redirect;
-use rocket::{get, routes, Outcome};
+use rocket::{async_trait, get, routes, Outcome};
 
 mod oauth2;
 
@@ -11,11 +11,15 @@ struct User {
     pub username: String,
 }
 
+#[async_trait]
 impl<'a, 'r> FromRequest<'a, 'r> for User {
     type Error = ();
 
-    fn from_request(request: &'a Request<'r>) -> request::Outcome<User, ()> {
-        let mut cookies = request.guard::<Cookies<'_>>().expect("request cookies");
+    async fn from_request(request: &'a Request<'r>) -> request::Outcome<User, ()> {
+        let mut cookies = request
+            .guard::<Cookies<'_>>()
+            .await
+            .expect("request cookies");
         if let Some(cookie) = cookies.get_private("username") {
             return Outcome::Success(User {
                 username: cookie.value().to_string(),
